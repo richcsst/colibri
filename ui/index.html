@@ -1763,5 +1763,134 @@ $('#mascotToggle').onclick=()=>setShown(!shown);setShown(shown);
 setView(location.hash.slice(1)||'chat');
 })();
 </script>
+<script>
+(function () {
+  function formatHMS(ms) {
+    const totalSec = Math.floor(ms / 1000);
+    const hrs = String(Math.floor(totalSec / 3600)).padStart(2, '0');
+    const mins = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
+    const secs = String(totalSec % 60).padStart(2, '0');
+    return `${hrs}:${mins}:${secs}`;
+  }
+
+  function findLastAssistantBubble() {
+    const candidates = document.querySelectorAll(
+      '[class*="assistant"], [class*="message"], [data-role="assistant"], .msg, article'
+    );
+    return candidates.length ? candidates[candidates.length - 1] : document.body;
+  }
+
+  function extractRequestModel(fetchArgs) {
+    try {
+      const init = fetchArgs[1];
+      if (init && typeof init.body === 'string') {
+        const parsed = JSON.parse(init.body);
+        if (parsed && parsed.model) {
+          // Strip directory paths if Colibri passes a full path like "E:\\colibri-models\\qwen38-flash-next"
+          return String(parsed.model).split(/[\\/]/).pop();
+        }
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function startLiveTimer(initialModel) {
+    const startTime = performance.now();
+    let modelName = initialModel;
+
+    const note = document.createElement('div');
+    note.style.cssText = 'color: #888888; font-size: 0.85em; margin-top: 8px; font-family: monospace;';
+    note.textContent = modelName
+      ? `[${modelName}] Processing...  00:00:00`
+      : 'Processing...  00:00:00';
+
+    findLastAssistantBubble().appendChild(note);
+
+    const intervalId = setInterval(() => {
+      const elapsed = performance.now() - startTime;
+      note.textContent = modelName
+        ? `[${modelName}] Processing...  ${formatHMS(elapsed)}`
+        : `Processing...  ${formatHMS(elapsed)}`;
+
+      const latestBubble = findLastAssistantBubble();
+      if (note.parentElement !== latestBubble) {
+        latestBubble.appendChild(note);
+      }
+    }, 250);
+
+    return {
+      setModel(name) {
+        if (name && !modelName) {
+          modelName = String(name).split(/[\\/]/).pop();
+        }
+      },
+      stop() {
+        clearInterval(intervalId);
+        const finalElapsed = performance.now() - startTime;
+        setTimeout(() => {
+          const latestBubble = findLastAssistantBubble();
+          if (note.parentElement !== latestBubble) {
+            latestBubble.appendChild(note);
+          }
+          const prefix = modelName ? `[${modelName}] ` : '';
+          note.textContent = `${prefix}Processing complete.  Completion time: ${formatHMS(finalElapsed)}`;
+        }, 150);
+      }
+    };
+  }
+
+  const origFetch = window.fetch;
+  window.fetch = async function (...args) {
+    const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+    const isChat = url.includes('/v1/chat/completions');
+    const tracker = isChat ? startLiveTimer(extractRequestModel(args)) : null;
+
+    try {
+      const response = await origFetch.apply(this, args);
+
+      if (isChat && response.body) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        const stream = new ReadableStream({
+          async start(controller) {
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                // Fallback: capture "model" from the SSE JSON chunk if the request didn't specify one
+                if (tracker && value) {
+                  const text = decoder.decode(value, { stream: true });
+                  const match = text.match(/"model"\s*:\s*"([^"]+)"/);
+                  if (match && match[1]) tracker.setModel(match[1]);
+                }
+
+                controller.enqueue(value);
+              }
+              controller.close();
+              if (tracker) tracker.stop();
+            } catch (err) {
+              if (tracker) tracker.stop();
+              controller.error(err);
+            }
+          }
+        });
+        return new Response(stream, {
+          headers: response.headers,
+          status: response.status,
+          statusText: response.statusText
+        });
+      } else if (isChat && tracker) {
+        tracker.stop();
+      }
+
+      return response;
+    } catch (err) {
+      if (tracker) tracker.stop();
+      throw err;
+    }
+  };
+})();
+</script>
 </body>
 </html>
